@@ -64,9 +64,16 @@ def rsi_wilder(closes, period=14):
     return 100 - 100 / (1 + ag / al)
 
 
+def _series(frame, col):
+    s = frame[col]
+    if hasattr(s, "columns"):  # 2D 情况取第一列
+        s = s.iloc[:, 0]
+    return s.dropna()
+
+
 def score_ticker(df):
-    close = df["Close"].dropna()
-    vol = df["Volume"].dropna()
+    close = _series(df, "Close")
+    vol = _series(df, "Volume")
     if len(close) < 70 or len(vol) < 25:
         return None, "bars"
     c = close.values.astype(float)
@@ -132,7 +139,7 @@ def main():
             try:
                 s, why = score_ticker(df)
             except Exception as e:
-                s, why = None, f"err:{type(e).__name__}"
+                s, why = None, f"err:{type(e).__name__}:{str(e)[:70]}"
             reasons[why] = reasons.get(why, 0) + 1
             if s:
                 rows.append((t, s))
