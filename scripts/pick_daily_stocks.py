@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-每日动态选股：根据市场动量从候选池里挑出 12 只（A股4 / 港股3 / 美股5）
-输出到 GitHub Actions 的 GITHUB_ENV: STOCK_LIST=...
-
-策略（纯规则，不调用 LLM，秒级完成）：
-  score = 0.45*mom20 + 0.25*mom60 + 0.15*量能放大 + 0.15*RSI甜区
-  硬过滤：价格 > MA50，RSI14 < 78，近 20 日波动率 < 15%
-失败兜底：某个市场数据全挂 → 用该市场默认龙头补位，保证每天都有 12 只
-"""
+"""每日动态选股 v2：从候选池按动量挑 12 只（A4/H3/US5）"""
 import json
 import os
 import sys
@@ -22,25 +14,23 @@ UNIVERSE = {
         "601088.SS", "600028.SS", "601668.SS", "601857.SS", "600900.SS", "601166.SS",
         "000333.SZ", "000651.SZ", "002594.SZ", "300750.SZ", "300059.SZ", "002475.SZ",
         "002415.SZ", "000725.SZ", "002714.SZ", "300760.SZ", "300124.SZ", "002352.SZ",
-        "600438.SS", "601633.SS", "600690.SS", "000001.SZ", "600016.SS", "601601.SS",
-        "601211.SS", "600585.SS", "000063.SZ", "002304.SZ",
     ],
     "hk": [
         "0700.HK", "9988.HK", "3690.HK", "1810.HK", "9618.HK", "9999.HK", "1024.HK",
         "2015.HK", "1211.HK", "0981.HK", "2318.HK", "0939.HK", "1398.HK", "3988.HK",
         "0883.HK", "0857.HK", "0386.HK", "2628.HK", "2388.HK", "0016.HK", "0001.HK",
-        "0027.HK", "1928.HK", "0291.HK", "1109.HK", "0688.HK", "2269.HK", "6060.HK",
-        "2359.HK", "6618.HK",
+        "0027.HK", "1928.HK", "0291.HK", "1109.HK", "0688.HK",
     ],
     "us": [
         "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "AMD", "NFLX",
         "CRM", "ORCL", "ADBE", "COST", "WMT", "JPM", "V", "MA", "UNH", "LLY",
-        "XOM", "CVX", "KO", "PEP", "MCD", "NKE", "DIS", "BA", "CAT", "GE",
+        "XOM", "CVX", "KO", "PEP", "MCD",
     ],
 }
 
 NEED = {"cn": 4, "hk": 3, "us": 5}
 
+# 兜底已经是仓库格式（hk 前缀只在 hk 市场加）
 FALLBACK = {
     "cn": ["600519", "300750", "002594", "601318"],
     "hk": ["hk00700", "hk09988", "hk01810"],
@@ -52,6 +42,8 @@ def to_repo_symbol(ticker: str, market: str) -> str:
     if market == "cn":
         return ticker.split(".")[0]
     if market == "hk":
+        if ticker.lower().startswith("hk"):
+            return ticker
         num = ticker.split(".")[0]
         return "hk" + num.zfill(4)
     return ticker
@@ -73,54 +65,61 @@ def rsi_wilder(closes, period=14):
 
 
 def score_ticker(df):
-    """df: DataFrame with Close/Volume, daily bars ascending"""
     close = df["Close"].dropna()
     vol = df["Volume"].dropna()
-    if len(close) < 70:
-        return None
-    c = close.values
+    if len(close) < 70 or len(vol) < 25:
+        return None, "bars"
+    c = close.values.astype(float)
     px = float(c[-1])
-    ma20 = float(c[-20:].mean())
     ma50 = float(c[-50:].mean())
-    mom20 = (px / float(c[-21]) - 1) * 100 if len(c) > 21 else 0
-    mom60 = (px / float(c[-61]) - 1) * 100 if len(c) > 61 else 0
+    mom20 = (px / float(c[-21]) - 1) * 100
+    mom60 = (px / float(c[-61]) - 1) * 100
     rsi = rsi_wilder(c)
     if rsi is None:
-        return None
+        return None, "rsi"
     volr = float(vol.values[-5:].mean() / max(vol.values[-20:].mean(), 1))
     rets = np.diff(c[-20:]) / c[-21:-1]
     volat = float(np.std(rets) * 100)
 
     if px <= ma50:
-        return None
+        return None, "below_ma50"
     if rsi >= 78:
-        return None
+        return None, "rsi_hot"
     if volat > 15:
-        return None
+        return None, "volatile"
 
-    sweet = max(0.0, 1 - abs(rsi - 62) / 25)  # 62 附近满分
+    sweet = max(0.0, 1 - abs(rsi - 62) / 25)
     score = 0.45 * mom20 + 0.25 * mom60 + 0.15 * (volr - 1) * 20 + 0.15 * sweet * 20
-    return {"score": score, "rsi": rsi, "mom20": mom20, "mom60": mom60, "volr": volr, "px": px}
+    return {"score": score, "rsi": rsi, "mom20": mom20, "mom60": mom60, "volr": volr, "px": px}, "ok"
 
 
 def fetch(pool):
     try:
         df = yf.download(
-            " ".join(pool), period="6mo", interval="1d",
+            tickers=" ".join(pool), period="6mo", interval="1d",
             group_by="ticker", auto_adjust=True, threads=True, progress=False,
         )
     except Exception as e:
-        print(f"[pick] download failed: {e}", file=sys.stderr)
+        print(f"[pick] download exception: {e}", file=sys.stderr)
         return {}
     out = {}
     for t in pool:
+        sub = None
         try:
-            sub = df[t] if hasattr(df.columns, "levels") else df
-            if sub["Close"].dropna().empty:
-                continue
-            out[t] = sub
+            if hasattr(df.columns, "levels"):
+                if t in df.columns.get_level_values(0):
+                    sub = df[t]
+                elif t in df.columns.get_level_values(1):
+                    sub = df.xs(t, axis=1, level=1)
+            else:
+                sub = df
         except Exception:
+            sub = None
+        if sub is None or "Close" not in getattr(sub, "columns", []):
             continue
+        if sub["Close"].dropna().empty:
+            continue
+        out[t] = sub
     return out
 
 
@@ -128,18 +127,20 @@ def main():
     picked, detail = [], {}
     for market, pool in UNIVERSE.items():
         data = fetch(pool)
-        rows = []
+        rows, reasons = [], {}
         for t, df in data.items():
             try:
-                s = score_ticker(df)
-            except Exception:
-                s = None
+                s, why = score_ticker(df)
+            except Exception as e:
+                s, why = None, f"err:{type(e).__name__}"
+            reasons[why] = reasons.get(why, 0) + 1
             if s:
                 rows.append((t, s))
         rows.sort(key=lambda x: -x[1]["score"])
         take = rows[: NEED[market]]
         print(
-            f"[pick] {market}: {len(rows)} 只通过过滤，选中 {[t for t, _ in take]}",
+            f"[pick] {market}: universe={len(pool)} downloaded={len(data)} pass={len(rows)} "
+            f"reasons={json.dumps(reasons)} picked={[t for t, _ in take]}",
             file=sys.stderr,
         )
         if len(take) < NEED[market]:
@@ -151,12 +152,9 @@ def main():
                     take.append((f, {"score": 0, "fallback": True}))
         picked.extend(to_repo_symbol(t, market) for t, _ in take)
         detail[market] = [
-            {
-                "symbol": to_repo_symbol(t, market),
-                "score": round(float(s.get("score", 0)), 2),
-                "rsi": round(float(s.get("rsi", 0)), 1) if "rsi" in s else None,
-                "mom20": round(float(s.get("mom20", 0)), 1) if "mom20" in s else None,
-            }
+            {"symbol": to_repo_symbol(t, market), "score": round(float(s.get("score", 0)), 2),
+             "rsi": round(float(s["rsi"]), 1) if "rsi" in s else None,
+             "mom20": round(float(s["mom20"]), 1) if "mom20" in s else None}
             for t, s in take
         ]
 
