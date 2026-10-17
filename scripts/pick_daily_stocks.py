@@ -85,7 +85,7 @@ def score_ticker(df):
     if rsi is None:
         return None, "rsi"
     volr = float(vol.values[-5:].mean() / max(vol.values[-20:].mean(), 1))
-    rets = np.diff(c[-20:]) / c[-21:-1]
+    rets = np.diff(c[-20:]) / c[-20:-1]
     volat = float(np.std(rets) * 100)
 
     if px <= ma50:
