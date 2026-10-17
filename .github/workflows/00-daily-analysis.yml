@@ -60,6 +60,10 @@ jobs:
         run: |
           mkdir -p data logs reports
       
+      - name: 动态选股（每日12只）
+        run: |
+          python scripts/pick_daily_stocks.py
+
       - name: 执行股票分析
         env:
           # ==========================================
@@ -472,7 +476,7 @@ jobs:
           fi
 
           # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'market-only' }}"
+          MODE="${{ github.event.inputs.mode || 'full' }}"
           
           echo "=========================================="
           echo "🚀 A股自选股智能分析系统"
