@@ -89,3 +89,6 @@ static/
 /apps/dsa-desktop/node_modules/
 /node_modules/
 docs/specs/
+
+# pick cache
+.cache/

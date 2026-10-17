@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
-"""每日动态选股 v2：从候选池按动量挑 12 只（A4/H3/US5）"""
+"""每日动态选股 v3：从候选池按动量挑 12 只（A股 4 / 港股 3 / 美股 5）
+
+v3 改动（相对 v2）:
+- 不再用 yfinance 批量下载（本机/CI 经常被 Yahoo 429 全灭，导致静默退化成 FALLBACK 固定股）
+- 改为直接调 Yahoo chart API：串行 + 退避重试 + query1/query2 轮换 + 当日磁盘缓存
+- A 股额外兜底：Yahoo 拿不到时用 Tushare（TUSHARE_TOKEN，或 ~/.openclaw/secrets/tushare.token）
+- 每个市场的失败原因会打印出来，不再无声降级
+
+用法:
+  python scripts/pick_daily_stocks.py [--no-cache] [--debug]
+输出:
+  stdout 最后一行 STOCK_LIST=...（同时写入 $GITHUB_ENV，Actions 里可直接用）
+"""
+import datetime
 import json
 import os
 import sys
+import time
+import urllib.request
 
-import numpy as np
-import yfinance as yf
+import pandas as pd
 
 UNIVERSE = {
     "cn": [
@@ -37,6 +51,19 @@ FALLBACK = {
     "us": ["AAPL", "NVDA", "MSFT", "TSLA", "AMZN"],
 }
 
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+)
+YF_HOSTS = ("query1", "query2")
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".cache", "pick")
+USE_CACHE = "--no-cache" not in sys.argv
+DEBUG = "--debug" in sys.argv
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
 
 def to_repo_symbol(ticker: str, market: str) -> str:
     if market == "cn":
@@ -52,10 +79,10 @@ def to_repo_symbol(ticker: str, market: str) -> str:
 def rsi_wilder(closes, period=14):
     if len(closes) < period + 1:
         return None
-    d = np.diff(closes)
-    gain = np.where(d > 0, d, 0.0)
-    loss = np.where(d < 0, -d, 0.0)
-    ag, al = gain[:period].mean(), loss[:period].mean()
+    d = closes.diff().dropna().values
+    gain = [x if x > 0 else 0.0 for x in d]
+    loss = [-x if x < 0 else 0.0 for x in d]
+    ag, al = sum(gain[:period]) / period, sum(loss[:period]) / period
     for i in range(period, len(d)):
         ag = (ag * (period - 1) + gain[i]) / period
         al = (al * (period - 1) + loss[i]) / period
@@ -81,12 +108,12 @@ def score_ticker(df):
     ma50 = float(c[-50:].mean())
     mom20 = (px / float(c[-21]) - 1) * 100
     mom60 = (px / float(c[-61]) - 1) * 100
-    rsi = rsi_wilder(c)
+    rsi = rsi_wilder(close)
     if rsi is None:
         return None, "rsi"
     volr = float(vol.values[-5:].mean() / max(vol.values[-20:].mean(), 1))
-    rets = np.diff(c[-20:]) / c[-20:-1]
-    volat = float(np.std(rets) * 100)
+    rets = pd.Series(c[-20:]).pct_change().dropna()
+    volat = float(rets.std() * 100)
 
     if px <= ma50:
         return None, "below_ma50"
@@ -97,77 +124,211 @@ def score_ticker(df):
 
     sweet = max(0.0, 1 - abs(rsi - 62) / 25)
     score = 0.45 * mom20 + 0.25 * mom60 + 0.15 * (volr - 1) * 20 + 0.15 * sweet * 20
-    return {"score": score, "rsi": rsi, "mom20": mom20, "mom60": mom60, "volr": volr, "px": px}, "ok"
+    return {
+        "score": score, "rsi": rsi, "mom20": mom20, "mom60": mom60,
+        "volr": volr, "px": px, "volat": volat,
+    }, "ok"
 
 
-def fetch(pool):
-    try:
-        df = yf.download(
-            tickers=" ".join(pool), period="6mo", interval="1d",
-            group_by="ticker", auto_adjust=True, threads=True, progress=False,
+# ---------------------------------------------------------------- 数据抓取
+
+def _get_json(url, timeout=25):
+    req = urllib.request.Request(
+        url, headers={"User-Agent": UA, "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def yahoo_fetch(ticker):
+    """直接拉 Yahoo chart API，返回 Close/Volume DataFrame（升序）。"""
+    last_err = None
+    for attempt in range(4):
+        host = YF_HOSTS[attempt % 2]
+        url = (
+            f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}"
+            "?range=6mo&interval=1d&events=div%2Csplits"
         )
-    except Exception as e:
-        print(f"[pick] download exception: {e}", file=sys.stderr)
-        return {}
-    out = {}
-    for t in pool:
-        sub = None
         try:
-            if hasattr(df.columns, "levels"):
-                if t in df.columns.get_level_values(0):
-                    sub = df[t]
-                elif t in df.columns.get_level_values(1):
-                    sub = df.xs(t, axis=1, level=1)
-            else:
-                sub = df
-        except Exception:
-            sub = None
-        if sub is None or "Close" not in getattr(sub, "columns", []):
-            continue
-        if sub["Close"].dropna().empty:
-            continue
-        out[t] = sub
+            j = _get_json(url)
+            res = ((j.get("chart") or {}).get("result") or [None])[0]
+            if not res:
+                raise ValueError("empty result")
+            quote = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+            closes = quote.get("close") or []
+            vols = quote.get("volume") or []
+            ts = res.get("timestamp") or []
+            n = min(len(closes), len(ts))
+            df = pd.DataFrame(
+                {"Close": closes[:n], "Volume": vols[:n] if vols else [0] * n},
+                index=pd.to_datetime(ts[:n], unit="s"),
+            ).dropna(subset=["Close"])
+            if len(df) < 70:
+                raise ValueError(f"bars={len(df)}")
+            return df
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if DEBUG:
+                log(f"[pick] {ticker} attempt {attempt + 1} via {host} failed: {e}")
+            time.sleep(0.7 * (attempt + 1))
+    raise last_err if last_err else RuntimeError("unknown")
+
+
+def _tushare_token():
+    tok = os.environ.get("TUSHARE_TOKEN", "").strip()
+    if tok:
+        return tok
+    path = os.path.expanduser("~/.openclaw/secrets/tushare.token")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def tushare_fetch(ticker):
+    """A 股兜底：Tushare daily -> Close/Volume DataFrame。"""
+    token = _tushare_token()
+    if not token:
+        raise RuntimeError("no TUSHARE_TOKEN")
+    code = ticker.replace(".SS", ".SH").replace(".SZ", ".SZ")
+    end = datetime.date.today()
+    start = end - datetime.timedelta(days=300)
+    payload = {
+        "api_name": "daily",
+        "token": token,
+        "params": {
+            "ts_code": code,
+            "start_date": start.strftime("%Y%m%d"),
+            "end_date": end.strftime("%Y%m%d"),
+        },
+        "fields": "trade_date,close,vol",
+    }
+    req = urllib.request.Request(
+        "http://api.tushare.pro",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": UA},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        j = json.loads(resp.read().decode("utf-8", "replace"))
+    if j.get("code") != 0:
+        raise RuntimeError(f"tushare code={j.get('code')} msg={j.get('msg')}")
+    items = ((j.get("data") or {}).get("items") or [])
+    if not items:
+        raise RuntimeError("tushare empty")
+    rows = sorted(items)  # trade_date 升序
+    df = pd.DataFrame(
+        {
+            "Close": [float(r[1]) for r in rows],
+            "Volume": [float(r[2]) * 100 for r in rows],
+        },
+        index=pd.to_datetime([str(r[0]) for r in rows], format="%Y%m%d"),
+    )
+    if len(df) < 70:
+        raise ValueError(f"bars={len(df)}")
+    return df
+
+
+def _cache_file(ticker):
+    day = datetime.date.today().strftime("%Y%m%d")
+    name = ticker.replace(".", "_") + f"_{day}.csv"
+    return os.path.join(CACHE_DIR, name)
+
+
+def fetch_one(ticker, market):
+    cf = _cache_file(ticker)
+    if USE_CACHE and os.path.exists(cf):
+        try:
+            df = pd.read_csv(cf, index_col=0, parse_dates=True)
+            if len(df) >= 70:
+                return df, "cache"
+        except Exception:  # noqa: BLE001
+            pass
+
+    errors = []
+    sources = [("yahoo", yahoo_fetch)]
+    if market == "cn":
+        sources.append(("tushare", tushare_fetch))
+    for name, fn in sources:
+        try:
+            df = fn(ticker)
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            df.to_csv(cf)
+            return df, name
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{name}:{type(e).__name__}:{str(e)[:60]}")
+
+    # 港股代码在某些源需要 4 位补零
+    if market == "hk" and not ticker[0].isdigit():
+        pass
+    raise RuntimeError(" | ".join(errors))
+
+
+def fetch(pool, market):
+    out, srcs = {}, {}
+    for t in pool:
+        try:
+            df, src = fetch_one(t, market)
+            out[t] = df
+            srcs[src] = srcs.get(src, 0) + 1
+        except Exception as e:  # noqa: BLE001
+            log(f"[pick] {t} FAILED: {e}")
+        time.sleep(0.35)  # 对 Yahoo 客气点
+    log(f"[pick] {market}: sources={json.dumps(srcs)}")
     return out
 
 
 def main():
     picked, detail = [], {}
+    used_fallback = {}
     for market, pool in UNIVERSE.items():
-        data = fetch(pool)
+        data = fetch(pool, market)
         rows, reasons = [], {}
         for t, df in data.items():
             try:
                 s, why = score_ticker(df)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 s, why = None, f"err:{type(e).__name__}:{str(e)[:70]}"
             reasons[why] = reasons.get(why, 0) + 1
             if s:
                 rows.append((t, s))
         rows.sort(key=lambda x: -x[1]["score"])
         take = rows[: NEED[market]]
-        print(
+        log(
             f"[pick] {market}: universe={len(pool)} downloaded={len(data)} pass={len(rows)} "
-            f"reasons={json.dumps(reasons)} picked={[t for t, _ in take]}",
-            file=sys.stderr,
+            f"reasons={json.dumps(reasons)} picked={[t for t, _ in take]}"
         )
         if len(take) < NEED[market]:
             have = {to_repo_symbol(t, market) for t, _ in take}
+            added = []
             for f in FALLBACK[market]:
                 if len(take) >= NEED[market]:
                     break
                 if f not in have:
                     take.append((f, {"score": 0, "fallback": True}))
+                    added.append(f)
+            if added:
+                used_fallback[market] = added
+                log(f"[pick] {market}: 数量不足，用兜底补 {added}")
+
         picked.extend(to_repo_symbol(t, market) for t, _ in take)
         detail[market] = [
-            {"symbol": to_repo_symbol(t, market), "score": round(float(s.get("score", 0)), 2),
-             "rsi": round(float(s["rsi"]), 1) if "rsi" in s else None,
-             "mom20": round(float(s["mom20"]), 1) if "mom20" in s else None}
+            {
+                "symbol": to_repo_symbol(t, market),
+                "score": round(float(s.get("score", 0)), 2),
+                "rsi": round(float(s["rsi"]), 1) if "rsi" in s else None,
+                "mom20": round(float(s["mom20"]), 1) if "mom20" in s else None,
+                "fallback": bool(s.get("fallback")),
+            }
             for t, s in take
         ]
 
     line = ",".join(picked)
     print(f"STOCK_LIST={line}")
-    print("[pick] detail=" + json.dumps(detail, ensure_ascii=False), file=sys.stderr)
+    log("[pick] detail=" + json.dumps(detail, ensure_ascii=False))
+    if used_fallback:
+        log(f"[pick] ⚠️ 有市场靠兜底补齐: {json.dumps(used_fallback, ensure_ascii=False)}")
 
     gh_env = os.environ.get("GITHUB_ENV")
     if gh_env:
