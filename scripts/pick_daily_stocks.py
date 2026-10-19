@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""每日动态选股 v4：纯美股，从候选池按动量挑 8 只。
+"""每日动态选股 v5：纯美股，从候选池按动量挑 8 只。
+
+v5 改动（相对 v4）：
+- 美股池从 43 只扩到 ~120 只（纳指 100 主体 + 高流动性大中盘），仍按动量挑 8 只
 
 v4 改动（相对 v3）：
-- 只保留美股池（约 40 只高流动性大中盘），不再覆盖 A 股 / 港股
+- 只保留美股池，不再覆盖 A 股 / 港股
 - NEED = {"us": 8}；兜底列表也只保留美股
 - 移除 Tushare / A 股 / 港股相关分叉，目录仅剩美股代码
 
@@ -26,22 +29,41 @@ import urllib.request
 
 import pandas as pd
 
-# 纯美股池：高流动性大中盘（约 40 只）
+# 纯美股池：高流动性大中盘（~120 只，纳指 100 为主体）
 UNIVERSE = {
     "us": [
         # 大型科技 / 互联网
-        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
+        "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "TSLA",
         "AVGO", "AMD", "NFLX", "CRM", "ORCL", "ADBE", "NOW", "INTU",
-        # 消费 / 医疗
-        "COST", "WMT", "KO", "PEP", "MCD", "DIS", "LLY", "UNH",
-        "ISRG", "TMO", "AMGN", "GILD",
-        # 金融 / 工业 / 能源
-        "JPM", "V", "MA", "GS", "XOM", "CVX",
-        # 半导体 / 软件 / 平台
-        "QCOM", "TXN", "AMAT", "LRCX", "MU", "PANW", "BKNG", "UBER",
-        "PLTR", "COIN",
+        "CSCO", "IBM", "DELL", "ANET",
+        # 半导体 / 硬件
+        "QCOM", "TXN", "AMAT", "LRCX", "MU", "ADI", "KLAC", "MRVL",
+        "INTC", "ASML", "ARM", "SMCI",
+        # 软件 / 平台 / 新经济
+        "PLTR", "PANW", "CRWD", "ZS", "FTNT", "DDOG", "SNOW", "NET",
+        "SHOP", "MELI", "UBER", "ABNB", "BKNG", "PYPL", "COIN", "HOOD",
+        "APP", "ADSK", "WDAY", "TEAM",
+        # 通讯
+        "TMUS", "CMCSA", "VZ", "T",
+        # 医疗
+        "LLY", "UNH", "ISRG", "TMO", "AMGN", "GILD", "VRTX", "REGN",
+        "ABBV", "JNJ", "PFE", "MRK", "BMY", "ABT", "DHR", "SYK",
+        "MDT", "ELV", "CI", "DXCM", "IDXX",
+        # 金融
+        "JPM", "V", "MA", "GS", "MS", "BAC", "WFC", "C", "SCHW",
+        "AXP", "BLK", "SPGI", "CME", "ICE",
+        # 消费
+        "COST", "WMT", "KO", "PEP", "MCD", "DIS", "SBUX", "NKE",
+        "MDLZ", "PM", "MO", "TGT", "LOW", "HD", "LULU", "MAR", "ORLY",
+        # 工业 / 能源 / 材料
+        "XOM", "CVX", "COP", "SLB", "CAT", "DE", "BA", "GE", "RTX",
+        "LMT", "NOC", "GD", "UNP", "UPS", "FDX", "ETN", "HON", "LIN", "FCX",
+        # 公用 / REIT
+        "NEE", "DUK", "SO", "AMT", "PLD",
     ],
 }
+# 去重并保持顺序（防止手工维护时重复代码导致重复请求）
+UNIVERSE["us"] = list(dict.fromkeys(UNIVERSE["us"]))
 
 NEED = {"us": 8}
 
