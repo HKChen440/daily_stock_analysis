@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""每日动态选股 v3：从候选池按动量挑 12 只（A股 4 / 港股 3 / 美股 5）
+"""每日动态选股 v4：纯美股，从候选池按动量挑 8 只。
 
-v3 改动（相对 v2）:
-- 不再用 yfinance 批量下载（本机/CI 经常被 Yahoo 429 全灭，导致静默退化成 FALLBACK 固定股）
-- 改为直接调 Yahoo chart API：串行 + 退避重试 + query1/query2 轮换 + 当日磁盘缓存
-- A 股额外兜底：Yahoo 拿不到时用 Tushare（TUSHARE_TOKEN，或 ~/.openclaw/secrets/tushare.token）
-- 每个市场的失败原因会打印出来，不再无声降级
+v4 改动（相对 v3）：
+- 只保留美股池（约 40 只高流动性大中盘），不再覆盖 A 股 / 港股
+- NEED = {"us": 8}；兜底列表也只保留美股
+- 移除 Tushare / A 股 / 港股相关分叉，目录仅剩美股代码
+
+v3 保留的能力：
+- 不依赖 yfinance 批量下载（CI 上经常被 Yahoo 429 全灭）
+- 直接调 Yahoo chart API：串行 + 退避重试 + query1/query2 轮换 + 当日磁盘缓存
+- 失败原因逐个打印，不再无声降级
 
 用法:
   python scripts/pick_daily_stocks.py [--no-cache] [--debug]
 输出:
-  stdout 最后一行 STOCK_LIST=...（同时写入 $GITHUB_ENV，Actions 里可直接用）
+  stdout 最后一行 STOCK_LIST=...；同时写入 $GITHUB_ENV 与 ./pick_stock_list.txt
+  （Actions 里后续步骤可直接读文件，避免被其他 STOCK_LIST 配置覆盖）
 """
 import datetime
 import json
@@ -21,34 +26,28 @@ import urllib.request
 
 import pandas as pd
 
+# 纯美股池：高流动性大中盘（约 40 只）
 UNIVERSE = {
-    "cn": [
-        "600519.SS", "000858.SZ", "601318.SS", "600036.SS", "601398.SS", "601288.SS",
-        "600030.SS", "601899.SS", "600887.SS", "601012.SS", "600276.SS", "600309.SS",
-        "601088.SS", "600028.SS", "601668.SS", "601857.SS", "600900.SS", "601166.SS",
-        "000333.SZ", "000651.SZ", "002594.SZ", "300750.SZ", "300059.SZ", "002475.SZ",
-        "002415.SZ", "000725.SZ", "002714.SZ", "300760.SZ", "300124.SZ", "002352.SZ",
-    ],
-    "hk": [
-        "0700.HK", "9988.HK", "3690.HK", "1810.HK", "9618.HK", "9999.HK", "1024.HK",
-        "2015.HK", "1211.HK", "0981.HK", "2318.HK", "0939.HK", "1398.HK", "3988.HK",
-        "0883.HK", "0857.HK", "0386.HK", "2628.HK", "2388.HK", "0016.HK", "0001.HK",
-        "0027.HK", "1928.HK", "0291.HK", "1109.HK", "0688.HK",
-    ],
     "us": [
-        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "AMD", "NFLX",
-        "CRM", "ORCL", "ADBE", "COST", "WMT", "JPM", "V", "MA", "UNH", "LLY",
-        "XOM", "CVX", "KO", "PEP", "MCD",
+        # 大型科技 / 互联网
+        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
+        "AVGO", "AMD", "NFLX", "CRM", "ORCL", "ADBE", "NOW", "INTU",
+        # 消费 / 医疗
+        "COST", "WMT", "KO", "PEP", "MCD", "DIS", "LLY", "UNH",
+        "ISRG", "TMO", "AMGN", "GILD",
+        # 金融 / 工业 / 能源
+        "JPM", "V", "MA", "GS", "XOM", "CVX",
+        # 半导体 / 软件 / 平台
+        "QCOM", "TXN", "AMAT", "LRCX", "MU", "PANW", "BKNG", "UBER",
+        "PLTR", "COIN",
     ],
 }
 
-NEED = {"cn": 4, "hk": 3, "us": 5}
+NEED = {"us": 8}
 
-# 兜底已经是仓库格式（hk 前缀只在 hk 市场加）
+# 兜底：全部为美股代码（与 NEED 数量对齐，保证报告只含美股）
 FALLBACK = {
-    "cn": ["600519", "300750", "002594", "601318"],
-    "hk": ["hk00700", "hk09988", "hk01810"],
-    "us": ["AAPL", "NVDA", "MSFT", "TSLA", "AMZN"],
+    "us": ["AAPL", "NVDA", "MSFT", "TSLA", "AMZN", "META", "GOOGL", "AVGO"],
 }
 
 UA = (
@@ -57,6 +56,7 @@ UA = (
 )
 YF_HOSTS = ("query1", "query2")
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".cache", "pick")
+LIST_FILE = os.path.join(os.getcwd(), "pick_stock_list.txt")
 USE_CACHE = "--no-cache" not in sys.argv
 DEBUG = "--debug" in sys.argv
 
@@ -65,15 +65,9 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
-def to_repo_symbol(ticker: str, market: str) -> str:
-    if market == "cn":
-        return ticker.split(".")[0]
-    if market == "hk":
-        if ticker.lower().startswith("hk"):
-            return ticker
-        num = ticker.split(".")[0]
-        return "hk" + num.zfill(4)
-    return ticker
+def to_repo_symbol(ticker: str) -> str:
+    """美股代码即仓库格式（裸 ticker，如 AAPL）。"""
+    return ticker.strip().upper()
 
 
 def rsi_wilder(closes, period=14):
@@ -141,7 +135,7 @@ def _get_json(url, timeout=25):
 
 
 def yahoo_fetch(ticker):
-    """直接拉 Yahoo chart API，返回 Close/Volume DataFrame（升序）。"""
+    """直接打 Yahoo chart API，返回 Close/Volume DataFrame（升序）。"""
     last_err = None
     for attempt in range(4):
         host = YF_HOSTS[attempt % 2]
@@ -174,62 +168,6 @@ def yahoo_fetch(ticker):
     raise last_err if last_err else RuntimeError("unknown")
 
 
-def _tushare_token():
-    tok = os.environ.get("TUSHARE_TOKEN", "").strip()
-    if tok:
-        return tok
-    path = os.path.expanduser("~/.openclaw/secrets/tushare.token")
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return fh.read().strip()
-    except OSError:
-        return ""
-
-
-def tushare_fetch(ticker):
-    """A 股兜底：Tushare daily -> Close/Volume DataFrame。"""
-    token = _tushare_token()
-    if not token:
-        raise RuntimeError("no TUSHARE_TOKEN")
-    code = ticker.replace(".SS", ".SH").replace(".SZ", ".SZ")
-    end = datetime.date.today()
-    start = end - datetime.timedelta(days=300)
-    payload = {
-        "api_name": "daily",
-        "token": token,
-        "params": {
-            "ts_code": code,
-            "start_date": start.strftime("%Y%m%d"),
-            "end_date": end.strftime("%Y%m%d"),
-        },
-        "fields": "trade_date,close,vol",
-    }
-    req = urllib.request.Request(
-        "http://api.tushare.pro",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": UA},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        j = json.loads(resp.read().decode("utf-8", "replace"))
-    if j.get("code") != 0:
-        raise RuntimeError(f"tushare code={j.get('code')} msg={j.get('msg')}")
-    items = ((j.get("data") or {}).get("items") or [])
-    if not items:
-        raise RuntimeError("tushare empty")
-    rows = sorted(items)  # trade_date 升序
-    df = pd.DataFrame(
-        {
-            "Close": [float(r[1]) for r in rows],
-            "Volume": [float(r[2]) * 100 for r in rows],
-        },
-        index=pd.to_datetime([str(r[0]) for r in rows], format="%Y%m%d"),
-    )
-    if len(df) < 70:
-        raise ValueError(f"bars={len(df)}")
-    return df
-
-
 def _cache_file(ticker):
     day = datetime.date.today().strftime("%Y%m%d")
     name = ticker.replace(".", "_") + f"_{day}.csv"
@@ -247,10 +185,7 @@ def fetch_one(ticker, market):
             pass
 
     errors = []
-    sources = [("yahoo", yahoo_fetch)]
-    if market == "cn":
-        sources.append(("tushare", tushare_fetch))
-    for name, fn in sources:
+    for name, fn in (("yahoo", yahoo_fetch),):
         try:
             df = fn(ticker)
             os.makedirs(CACHE_DIR, exist_ok=True)
@@ -258,10 +193,6 @@ def fetch_one(ticker, market):
             return df, name
         except Exception as e:  # noqa: BLE001
             errors.append(f"{name}:{type(e).__name__}:{str(e)[:60]}")
-
-    # 港股代码在某些源需要 4 位补零
-    if market == "hk" and not ticker[0].isdigit():
-        pass
     raise RuntimeError(" | ".join(errors))
 
 
@@ -300,22 +231,23 @@ def main():
             f"reasons={json.dumps(reasons)} picked={[t for t, _ in take]}"
         )
         if len(take) < NEED[market]:
-            have = {to_repo_symbol(t, market) for t, _ in take}
+            have = {to_repo_symbol(t) for t, _ in take}
             added = []
             for f in FALLBACK[market]:
                 if len(take) >= NEED[market]:
                     break
                 if f not in have:
                     take.append((f, {"score": 0, "fallback": True}))
+                    have.add(f)
                     added.append(f)
             if added:
                 used_fallback[market] = added
-                log(f"[pick] {market}: 数量不足，用兜底补 {added}")
+                log(f"[pick] {market}: 数量不足，用兜底补 {len(added)} 只: {added}")
 
-        picked.extend(to_repo_symbol(t, market) for t, _ in take)
+        picked.extend(to_repo_symbol(t) for t, _ in take)
         detail[market] = [
             {
-                "symbol": to_repo_symbol(t, market),
+                "symbol": to_repo_symbol(t),
                 "score": round(float(s.get("score", 0)), 2),
                 "rsi": round(float(s["rsi"]), 1) if "rsi" in s else None,
                 "mom20": round(float(s["mom20"]), 1) if "mom20" in s else None,
@@ -328,12 +260,20 @@ def main():
     print(f"STOCK_LIST={line}")
     log("[pick] detail=" + json.dumps(detail, ensure_ascii=False))
     if used_fallback:
-        log(f"[pick] ⚠️ 有市场靠兜底补齐: {json.dumps(used_fallback, ensure_ascii=False)}")
+        log(f"[pick] WARN 部分标的来自兜底列表: {json.dumps(used_fallback, ensure_ascii=False)}")
 
     gh_env = os.environ.get("GITHUB_ENV")
     if gh_env:
         with open(gh_env, "a", encoding="utf-8") as fh:
             fh.write(f"STOCK_LIST={line}\n")
+
+    # 供 workflow 后续步骤直接读取（优先级最高，避免被 vars/secrets 覆盖）
+    try:
+        with open(LIST_FILE, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(line + "\n")
+        log(f"[pick] wrote {LIST_FILE}")
+    except OSError as e:  # noqa: BLE001
+        log(f"[pick] WARN 无法写入 {LIST_FILE}: {e}")
 
 
 if __name__ == "__main__":

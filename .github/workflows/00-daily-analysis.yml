@@ -60,7 +60,7 @@ jobs:
         run: |
           mkdir -p data logs reports
       
-      - name: 动态选股（每日12只）
+      - name: 动态选股（每日 8 只美股）
         run: |
           python scripts/pick_daily_stocks.py
 
@@ -428,7 +428,7 @@ jobs:
           # ==========================================
           # 避免直接写入 STOCK_LIST，保留同名 Environment variables 的 runner 环境值。
           STOCK_LIST_CONFIG: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
-          MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'cn' }}
+          MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'us' }}
           MARKET_REVIEW_COLOR_SCHEME: ${{ vars.MARKET_REVIEW_COLOR_SCHEME || secrets.MARKET_REVIEW_COLOR_SCHEME || 'green_up' }}
           
           # ==========================================
@@ -455,14 +455,19 @@ jobs:
           REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
           
         run: |
-          # 解析自选股配置：
+          # 解析自选股配置（仅美股）：
           # 1. Repository/Environment secrets 或 Repository variables（STOCK_LIST_CONFIG）
           # 2. 同名 Environment variables 注入的 runner 环境变量（STOCK_LIST）
           # 3. 最小默认值
-          if [ -n "${STOCK_LIST_CONFIG:-}" ]; then
+          # 动态选股产出的 pick_stock_list.txt 优先级最高，避免被 STOCK_LIST_CONFIG / vars.STOCK_LIST 覆盖
+          if [ -s "pick_stock_list.txt" ]; then
+            export STOCK_LIST="$(tr -d '\r\n' < pick_stock_list.txt)"
+            echo "✅ 使用动态选股结果（pick_stock_list.txt）"
+          elif [ -n "${STOCK_LIST_CONFIG:-}" ]; then
             export STOCK_LIST="$STOCK_LIST_CONFIG"
+            echo "⚠️ 未找到动态选股结果，回退到 STOCK_LIST_CONFIG"
           elif [ -z "${STOCK_LIST:-}" ]; then
-            export STOCK_LIST="600519"
+            export STOCK_LIST="AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA,AVGO"
           fi
 
           # 处理 LITELLM YAML 配置文件
@@ -479,7 +484,7 @@ jobs:
           MODE="${{ github.event.inputs.mode || 'full' }}"
           
           echo "=========================================="
-          echo "🚀 A股自选股智能分析系统"
+          echo "🚀 美股自选股智能分析系统"
           echo "=========================================="
           echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           echo "🎯 运行模式: $MODE"
@@ -548,6 +553,12 @@ jobs:
           echo "=========================================="
           echo ""
           
+          # 校验：STOCK_LIST 不应含 A 股 / 港股代码
+          if echo "$STOCK_LIST" | grep -Eq '^(sh|sz|bj|hk)[0-9]|[0-9]{6}'; then
+            echo "❌ STOCK_LIST 含非美股代码: $STOCK_LIST"
+            exit 1
+          fi
+          echo "✅ STOCK_LIST 均为美股代码"
           # 构建命令行参数
           FORCE_RUN_ARG=""
           if [ "${{ github.event.inputs.force_run }}" = "true" ]; then

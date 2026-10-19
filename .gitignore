@@ -92,3 +92,5 @@ docs/specs/
 
 # pick cache
 .cache/
+# 动态选股运行时产物
+pick_stock_list.txt
