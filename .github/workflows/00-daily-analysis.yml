@@ -1,9 +1,11 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
-  schedule:
-    - cron: '0 12 * * 1-5'     # 周一到周五，UTC 10:00 = 北京时间 18:00
+  # ⚠️ 2026-11-23 停用 GitHub 原生定时：schedule 实测经常延迟数小时（甚至跨到次日 04:00 北京），
+  # 造成漏跑 + 与本地触发重复跑。现由本地 cron（北京时间 20:10 / 23:10）经 workflow_dispatch 触发，
+  # 脚本 scripts/dsa-trigger.js（去重：当天已成功则不重复跑）。要恢复原生定时，取消下面两行注释即可。
+  # schedule:
+  #   - cron: '0 12 * * 1-5'
   
   # 手动触发
   workflow_dispatch:
